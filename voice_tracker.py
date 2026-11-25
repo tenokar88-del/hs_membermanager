@@ -375,7 +375,8 @@ class VoiceTracker(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         await self.safe_sync()
         rows = await self.pool.fetch(
-            "SELECT * FROM voice_stats ORDER BY games DESC, total_seconds DESC"
+            "SELECT * FROM voice_stats WHERE games > 0 "
+            "ORDER BY games DESC, total_seconds DESC"
         )
         buffer = io.StringIO()
         writer = csv.writer(buffer)
