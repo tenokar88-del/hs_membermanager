@@ -22,7 +22,7 @@ MIN_MINUTES = 2                  # 함께한 시간이 이 분 이상이면 게�
 TICK_SECONDS = 60                 # 중간 정산 주기(초)
 RANKING_SIZE = 20                 # /랭킹 에 보여줄 인원
 ROOM_ROLE_PATTERN = re.compile(r"Room-\d+-Member")  # 게임방을 알아보는 역할 이름
-EXCLUDED_CATEGORY_IDS: set[int] = set()             # 무조건 제외할 카테고리 ID
+EXCLUDED_CATEGORY_IDS: set[int] = {1508118244727197887, 1509798130760155259}             # 무조건 제외할 카테고리 ID
 # ────────────────────────────────
 
 SCHEMA = """
