@@ -1,7 +1,7 @@
 """음성방 게임 횟수 집계 기능 (설정, DB, 정산, 명령어).
 
 게임방 카테고리에서 다른 사람과 함께 있던 시간을 쌓고,
-방(카테고리) 하나에서 MIN_MINUTES 이상이면 게임 1회로 인정한다.
+MIN_MEMBERS명 이상 함께한 시간이 방(카테고리) 하나에서 MIN_MINUTES 이상이면 게임 1회로 인정한다.
 """
 
 import asyncio
@@ -18,8 +18,9 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 # ───────────── 설정 ─────────────
-MIN_MINUTES = 4                  # 함께한 시간이 이 분 이상이면 게임 1회 인정
-TICK_SECONDS = 60                 # 중간 정산 주기(초)
+MIN_MINUTES = 60                  # 함께한 시간이 이 분 이상이면 게임 1회 인정
+MIN_MEMBERS = 3                   # 방에 이 인원 이상 있어야 시간을 셈 (본인 포함, 봇 제외)
+TICK_SECONDS = 120                 # 중간 정산 주기(초)
 RANKING_SIZE = 20                 # /랭킹 에 보여줄 인원
 ROOM_ROLE_PATTERN = re.compile(r"Room-\d+-Member")  # 게임방을 알아보는 역할 이름
 EXCLUDED_CATEGORY_IDS: set[int] = {1508118244727197887, 1509798130760155259, 1508468808849821798}             # 무조건 제외할 카테고리 ID
@@ -104,7 +105,7 @@ async def apply_snapshot(
     headcount = Counter(present.values())
 
     def is_together(user_id: int, category_id: int) -> bool:
-        return present.get(user_id) == category_id and headcount[category_id] >= 2
+        return present.get(user_id) == category_id and headcount[category_id] >= MIN_MEMBERS
 
     rows = await conn.fetch("SELECT * FROM voice_session FOR UPDATE")
     known = set()
@@ -233,7 +234,7 @@ class VoiceTracker(commands.Cog):
         await self.safe_sync()
         if not self.tick.is_running():
             self.tick.start()
-        log.info("준비 완료 (인정 기준 %s분)", MIN_MINUTES)
+        log.info("준비 완료 (인정 기준 %s명, %s분)", MIN_MEMBERS, MIN_MINUTES)
 
     @commands.Cog.listener()
     async def on_resumed(self):
@@ -291,7 +292,7 @@ class VoiceTracker(commands.Cog):
             title="게임 횟수 랭킹",
             description="\n".join(lines) or "아직 기록이 없어요.",
         )
-        embed.set_footer(text=f"{MIN_MINUTES}분 이상 함께하면 1회")
+        embed.set_footer(text=f"{MIN_MEMBERS}명 이상 {MIN_MINUTES}분 이상 함께하면 1회")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="내보내기", description="전체 유저 기록을 CSV로 받습니다")
