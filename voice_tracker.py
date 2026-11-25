@@ -21,7 +21,7 @@ from discord.ext import commands, tasks
 MIN_MINUTES = 60                  # 함께한 시간이 이 분 이상이면 게임 1회 인정
 MIN_MEMBERS = 3                   # 방에 이 인원 이상 있어야 시간을 셈 (본인 포함, 봇 제외)
 TICK_SECONDS = 120                 # 중간 정산 주기(초)
-RANKING_SIZE = 20                 # /랭킹 에 보여줄 인원
+RANKING_SIZE = 50                 # /게임랭킹 에 보여줄 인원
 ROOM_ROLE_PATTERN = re.compile(r"Room-\d+-Member")  # 게임방을 알아보는 역할 이름
 EXCLUDED_CATEGORY_IDS: set[int] = {1508118244727197887, 1509798130760155259, 1508468808849821798}             # 무조건 제외할 카테고리 ID
 # ────────────────────────────────
@@ -174,10 +174,70 @@ def csv_safe(text: str) -> str:
     return "'" + text if text.startswith(("=", "+", "-", "@")) else text
 
 
+def user_label(guild, user_id: int) -> str:
+    """멘션 옆에 사용자명을 붙인다. 예: <@123> (username)"""
+    member = guild.get_member(user_id)
+    name = discord.utils.escape_markdown(member.name) if member else "서버에 없음"
+    return f"<@{user_id}> ({name})"
+
+
+def split_lines(lines: list[str], limit: int) -> list[str]:
+    """디스코드 글자 수 제한에 맞게 줄 단위로 나눈다."""
+    chunks: list[str] = []
+    for line in lines:
+        if chunks and len(chunks[-1]) + 1 + len(line) <= limit:
+            chunks[-1] += "\n" + line
+        else:
+            chunks.append(line)
+    return chunks
+
+
 def admin_only(func):
     func = app_commands.checks.has_permissions(manage_guild=True)(func)
     func = app_commands.default_permissions(manage_guild=True)(func)
     return app_commands.guild_only()(func)
+
+
+class ResetConfirmView(discord.ui.View):
+    """기록 초기화 전 [삭제] / [취소] 확인."""
+
+    def __init__(self, cog: "VoiceTracker", interaction: discord.Interaction):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.origin = interaction  # 시간 초과 때 확인 메시지를 고치기 위해 보관
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return (
+            interaction.user.id == self.origin.user.id
+            and interaction.permissions.manage_guild
+        )
+
+    @discord.ui.button(label="삭제", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()  # 두 번 눌러도 한 번만 실행
+        await interaction.response.edit_message(content="삭제하는 중…", view=None)
+        try:
+            await self.cog.reset_stats()
+        except Exception:
+            log.exception("기록 초기화 실패")
+            result = "초기화하지 못했어요. 봇 로그를 확인해 주세요."
+        else:
+            log.warning("게임 기록 초기화: 실행한 유저=%s", interaction.user.id)
+            result = "게임 기록을 모두 삭제했어요."
+        await interaction.edit_original_response(content=result)
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="취소했어요. 기록은 그대로예요.", view=None)
+
+    async def on_timeout(self):
+        try:
+            await self.origin.edit_original_response(
+                content="시간이 지나 취소됐어요. 기록은 그대로예요.", view=None
+            )
+        except discord.HTTPException:
+            pass  # 확인 메시지를 이미 닫은 경우
 
 
 class VoiceTracker(commands.Cog):
@@ -197,13 +257,23 @@ class VoiceTracker(commands.Cog):
 
     async def sync_voice(self):
         async with self.lock:
-            guild = self.bot.get_guild(self.guild_id)
-            if not self.online or guild is None or guild.unavailable:
-                return
-            self.warn_hidden(guild)
-            present, occupied = read_voice_state(guild)
-            async with self.pool.acquire() as conn, conn.transaction():
-                await apply_snapshot(conn, present, occupied, discord.utils.utcnow())
+            await self._sync_locked()
+
+    async def _sync_locked(self):
+        """self.lock 을 잡은 상태에서 호출한다."""
+        guild = self.bot.get_guild(self.guild_id)
+        if not self.online or guild is None or guild.unavailable:
+            return
+        self.warn_hidden(guild)
+        present, occupied = read_voice_state(guild)
+        async with self.pool.acquire() as conn, conn.transaction():
+            await apply_snapshot(conn, present, occupied, discord.utils.utcnow())
+
+    async def reset_stats(self):
+        async with self.lock:
+            # 지금까지의 시간을 먼저 정산해야 초기화 뒤 기록에 섞이지 않는다
+            await self._sync_locked()
+            await self.pool.execute("TRUNCATE voice_stats")
 
     async def safe_sync(self):
         try:
@@ -275,25 +345,29 @@ class VoiceTracker(commands.Cog):
         else:
             await interaction.response.send_message(message, ephemeral=True)
 
-    @app_commands.command(name="랭킹", description="게임 횟수 순위를 봅니다")
+    @app_commands.command(name="게임랭킹", description="게임 횟수 순위를 봅니다")
     @admin_only
     async def ranking(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         await self.safe_sync()
         rows = await self.pool.fetch(
-            "SELECT * FROM voice_stats ORDER BY games DESC, total_seconds DESC LIMIT $1",
+            "SELECT * FROM voice_stats WHERE games > 0 "
+            "ORDER BY games DESC, total_seconds DESC LIMIT $1",
             RANKING_SIZE,
         )
         lines = [
-            f"{i}. <@{r['user_id']}> · **{r['games']}회** · {format_duration(r['total_seconds'])}"
+            f"{i}. {user_label(interaction.guild, r['user_id'])} · **{r['games']}회** · "
+            f"{format_duration(r['total_seconds'])}"
             for i, r in enumerate(rows, 1)
         ]
-        embed = discord.Embed(
-            title="게임 횟수 랭킹",
-            description="\n".join(lines) or "아직 기록이 없어요.",
-        )
-        embed.set_footer(text=f"{MIN_MEMBERS}명 이상 {MIN_MINUTES}분 이상 함께하면 1회")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        pages = split_lines(lines, 4096) or ["아직 기록이 없어요."]
+        for number, page in enumerate(pages, 1):
+            embed = discord.Embed(title="게임 횟수 랭킹", description=page)
+            footer = f"{MIN_MEMBERS}명 이상 {MIN_MINUTES}분 이상 함께하면 1회"
+            if len(pages) > 1:
+                footer += f" · {number}/{len(pages)}"
+            embed.set_footer(text=footer)
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="내보내기", description="전체 유저 기록을 CSV로 받습니다")
     @admin_only
@@ -320,7 +394,17 @@ class VoiceTracker(commands.Cog):
             file=discord.File(data, filename="voice_stats.csv"), ephemeral=True
         )
 
-    @app_commands.command(name="상태", description="지금 집계 중인 방과 누적 시간을 봅니다")
+    @app_commands.command(name="게임기록초기화", description="게임 횟수와 누적 시간을 모두 삭제합니다")
+    @admin_only
+    async def reset(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "⚠️ **모든 유저의 게임 횟수와 누적 시간을 삭제할까요?**\n"
+            "되돌릴 수 없어요. 보관이 필요하면 먼저 `/내보내기`를 실행하세요.",
+            view=ResetConfirmView(self, interaction),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="게임상태", description="지금 집계 중인 방과 누적 시간을 봅니다")
     @admin_only
     async def status(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -334,7 +418,8 @@ class VoiceTracker(commands.Cog):
             state = "누적 중" if r["together_since"] else "멈춤"
             done = " · 인정됨" if r["counted"] else ""
             lines.append(
-                f"{category.name if category else r['category_id']} · <@{r['user_id']}> · "
+                f"{category.name if category else r['category_id']} · "
+                f"{user_label(interaction.guild, r['user_id'])} · "
                 f"{format_duration(r['together_seconds'])} · {state}{done}"
             )
         hidden = sum(
@@ -343,9 +428,7 @@ class VoiceTracker(commands.Cog):
         )
         if hidden:
             lines.insert(0, f"⚠️ 봇이 볼 수 없는 음성 채널 {hidden}개")
-        text = "\n".join(lines) or "집계 중인 방이 없어요."
-        if len(text) > 1900:
-            text = text[:1900] + "\n…"
-        await interaction.followup.send(
-            text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
-        )
+        for text in split_lines(lines, 2000) or ["집계 중인 방이 없어요."]:
+            await interaction.followup.send(
+                text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+            )
