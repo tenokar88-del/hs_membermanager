@@ -11,12 +11,17 @@ import logging
 import os
 import re
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import asyncpg
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+
+def env_id(name: str) -> int:
+    """환경 변수의 디스코드 ID. 없으면 0."""
+    return int(os.getenv(name, "").strip() or 0)
+
 
 # ───────────── 설정 ─────────────
 MIN_MINUTES = 60                  # 함께한 시간이 이 분 이상이면 게임 1회 인정
@@ -26,7 +31,18 @@ RANKING_SIZE = 50                 # /게임랭킹 에 보여줄 인원
 ROOM_ROLE_PATTERN = re.compile(r"Room-\d+-Member")  # 게임방을 알아보는 역할 이름
 EXCLUDED_CATEGORY_IDS: set[int] = {1508118244727197887, 1509798130760155259, 1508468808849821798}             # 무조건 제외할 카테고리 ID
 # 부관리자 역할 ID (환경 변수, 없으면 서버 관리자만 사용)
-SUB_MANAGER_ROLE_ID = int(os.getenv("SUB_MANAGER_ROLE_ID", "").strip() or 0)
+SUB_MANAGER_ROLE_ID = env_id("SUB_MANAGER_ROLE_ID")
+
+# 월간 정산: 매월 1일, 한국 시간
+MONTHLY_FIRST_RUN = "2026-12"     # 이 달(YYYY-MM)의 1일부터 실행
+MONTHLY_HOUR = 6                  # 실행 시각(시)
+ELITE_REMOVE_MAX = 3              # 이 횟수 이하면 Elite 역할 해제
+ELITE_GRANT_MIN = 8               # 이 횟수 이상이면 Elite 역할 부여
+ELITE_GM_ROLE_ID = env_id("ELITE_GM_ROLE_ID")
+ELITE_PLAYER_ROLE_ID = env_id("ELITE_PLAYER_ROLE_ID")
+NORMAL_GM_ROLE_ID = env_id("NORMAL_GM_ROLE_ID")
+NORMAL_PLAYER_ROLE_ID = env_id("NORMAL_PLAYER_ROLE_ID")
+LOG_CHANNEL_ID = env_id("LOG_CHANNEL_ID")
 # ────────────────────────────────
 
 SCHEMA = """
@@ -43,6 +59,10 @@ CREATE TABLE IF NOT EXISTS voice_stats (
     games         INTEGER NOT NULL DEFAULT 0,
     total_seconds BIGINT  NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS voice_monthly (
+    period TEXT        PRIMARY KEY,
+    ran_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 ADD_STATS = """
@@ -53,6 +73,7 @@ SET games = voice_stats.games + EXCLUDED.games,
 """
 
 log = logging.getLogger("voicebot")
+KST = timezone(timedelta(hours=9))
 
 
 # ───────────── 디스코드 상태 읽기 ─────────────
@@ -195,6 +216,157 @@ def split_lines(lines: list[str], limit: int) -> list[str]:
     return chunks
 
 
+def build_csv(guild, rows) -> discord.File:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["유저ID", "계정명", "닉네임", "게임횟수", "누적시간(분)"])
+    for r in rows:
+        member = guild.get_member(r["user_id"])
+        writer.writerow([
+            r["user_id"],
+            csv_safe(member.name) if member else "",
+            csv_safe(member.display_name) if member else "(서버에 없음)",
+            r["games"],
+            r["total_seconds"] // 60,
+        ])
+    data = io.BytesIO(buffer.getvalue().encode("utf-8-sig"))  # 엑셀 한글 깨짐 방지
+    return discord.File(data, filename="voice_stats.csv")
+
+
+# ───────────── 월간 정산 ─────────────
+def due_period(now: datetime) -> str | None:
+    """지금이 정산할 때면 "YYYY-MM", 아니면 None. 1일 당일에만 실행한다."""
+    local = now.astimezone(KST)
+    if local.day != 1 or local.hour < MONTHLY_HOUR:
+        return None
+    period = f"{local:%Y-%m}"
+    return period if period >= MONTHLY_FIRST_RUN else None
+
+
+def monthly_problems(guild) -> list[str]:
+    """정산을 시작하기 전에 설정과 권한을 확인한다."""
+    problems = []
+    if not guild.me.guild_permissions.manage_roles:
+        problems.append("봇에게 '역할 관리' 권한이 없음")
+    for name, role_id, editable in (
+        ("ELITE_GM_ROLE_ID", ELITE_GM_ROLE_ID, True),
+        ("ELITE_PLAYER_ROLE_ID", ELITE_PLAYER_ROLE_ID, True),
+        ("NORMAL_GM_ROLE_ID", NORMAL_GM_ROLE_ID, False),
+        ("NORMAL_PLAYER_ROLE_ID", NORMAL_PLAYER_ROLE_ID, False),
+    ):
+        role = guild.get_role(role_id)
+        if role is None:
+            problems.append(f"{name} 역할을 찾을 수 없음")
+        elif editable and role >= guild.me.top_role:
+            problems.append(f"봇의 역할이 '{role.name}' 역할보다 아래에 있음")
+    channel = guild.get_channel(LOG_CHANNEL_ID)
+    if channel is None:
+        problems.append("LOG_CHANNEL_ID 채널을 찾을 수 없음")
+    else:
+        perms = channel.permissions_for(guild.me)
+        if not (perms.view_channel and perms.send_messages and perms.attach_files):
+            problems.append("로그 채널의 보기/메시지 보내기/파일 첨부 권한이 부족함")
+    return problems
+
+
+def monthly_plan(guild, games: dict[int, int]) -> tuple[list, list]:
+    """(해제 목록, 부여 목록). 각 항목은 (멤버, 역할 목록, 횟수)."""
+    elite_gm = guild.get_role(ELITE_GM_ROLE_ID)
+    elite_player = guild.get_role(ELITE_PLAYER_ROLE_ID)
+    pairs = (
+        (guild.get_role(NORMAL_PLAYER_ROLE_ID), elite_player),
+        (guild.get_role(NORMAL_GM_ROLE_ID), elite_gm),
+    )
+
+    removals = []
+    for member in set(elite_gm.members) | set(elite_player.members):
+        count = games.get(member.id, 0)  # 기록이 없으면 0회
+        if not member.bot and count <= ELITE_REMOVE_MAX:
+            roles = [r for r in (elite_gm, elite_player) if r in member.roles]
+            removals.append((member, roles, count))
+
+    grants = []
+    for user_id, count in games.items():
+        member = guild.get_member(user_id)
+        if member is None or member.bot or count < ELITE_GRANT_MIN:
+            continue
+        roles = [
+            elite for normal, elite in pairs
+            if normal in member.roles and elite not in member.roles
+        ]
+        if roles:
+            grants.append((member, roles, count))
+    return removals, grants
+
+
+def preview_lines(guild, games: dict[int, int]) -> list[str]:
+    """지금 정산한다면 어떻게 되는지. 아무것도 바꾸지 않는다."""
+    lines = ["**역할 변경 미리보기** (현재 기록 기준, 아무것도 바꾸지 않았어요)"]
+    problems = monthly_problems(guild)
+    if problems:
+        lines += [f"⚠️ 이대로면 정산이 실행되지 않아요: {problem}" for problem in problems]
+    role_ids = (ELITE_GM_ROLE_ID, ELITE_PLAYER_ROLE_ID, NORMAL_GM_ROLE_ID, NORMAL_PLAYER_ROLE_ID)
+    if any(guild.get_role(role_id) is None for role_id in role_ids):
+        return lines  # 역할을 모르면 대상을 계산할 수 없음
+    if not any(games.values()):
+        lines.append("⚠️ 1회 이상 참여한 기록이 없어 정산이 중단돼요.")
+        return lines
+
+    removals, grants = monthly_plan(guild, games)
+    for title, plan in (("해제", removals), ("부여", grants)):
+        lines.append(f"**Elite {title} 예정 {len(plan)}명**")
+        for member, roles, count in sorted(plan, key=lambda x: (-x[2], x[0].name)):
+            names = discord.utils.escape_markdown(", ".join(r.name for r in roles))
+            lines.append(f"- {user_label(guild, member.id)} · {count}회 · {names}")
+        if not plan:
+            lines.append("- 없음")
+    return lines
+
+
+def removal_message(guild_name: str, roles: str, count: int) -> str:
+    return (
+        f"안녕하세요, **{guild_name}** 서버에서 알려드려요.\n"
+        f"지난 집계 기간의 게임 참여가 {count}회로 활동 기준에 미치지 못해 "
+        f"**{roles}** 역할이 해제되었어요.\n"
+        "앞으로도 게임에서 자주 만나요!"
+    )
+
+
+def grant_message(guild_name: str, roles: str, count: int) -> str:
+    return (
+        f"축하해요! 🎉 **{guild_name}** 서버에서 알려드려요.\n"
+        f"지난 집계 기간에 게임에 {count}회 참여해 활동 기준을 채워서 "
+        f"**{roles}** 역할이 부여되었어요.\n"
+        "함께해 주셔서 감사해요!"
+    )
+
+
+async def change_roles(guild, plan, *, grant: bool) -> list[str]:
+    """역할을 바꾸고 DM을 보낸 뒤, 로그에 남길 줄을 돌려준다."""
+    lines = []
+    for member, roles, count in plan:
+        names = ", ".join(r.name for r in roles)
+        line = (
+            f"- {user_label(guild, member.id)} · {count}회 · "
+            f"{discord.utils.escape_markdown(names)}"
+        )
+        try:
+            change = member.add_roles if grant else member.remove_roles
+            await change(*roles, reason="월간 게임 활동 정산")
+        except discord.HTTPException:
+            log.exception("역할 변경 실패: user=%s", member.id)
+            lines.append(line + " · ⚠️ 역할 변경 실패")
+            continue
+        log.info("역할 %s: user=%s roles=%s", "부여" if grant else "해제", member.id, names)
+        try:
+            message = grant_message if grant else removal_message
+            await member.send(message(guild.name, names, count))
+        except discord.HTTPException:
+            line += " · DM 전송 실패"
+        lines.append(line)
+    return lines
+
+
 def admin_only(func):
     func = app_commands.checks.has_permissions(manage_guild=True)(func)
     func = app_commands.default_permissions(manage_guild=True)(func)
@@ -267,12 +439,14 @@ class VoiceTracker(commands.Cog):
         self.lock = asyncio.Lock()  # 정산이 겹치지 않게
         self.online = False         # 연결이 끊긴 동안에는 정산하지 않음
         self.warned: set[int] = set()
+        self.monthly_error: str | None = None  # 같은 오류를 반복해서 알리지 않게
 
     async def cog_load(self):
         await self.pool.execute(SCHEMA)
 
     async def cog_unload(self):
         self.tick.cancel()
+        self.monthly.cancel()
 
     async def sync_voice(self):
         async with self.lock:
@@ -313,6 +487,82 @@ class VoiceTracker(commands.Cog):
     async def tick(self):
         await self.safe_sync()
 
+    # ── 월간 정산 ──
+    @tasks.loop(minutes=1)
+    async def monthly(self):
+        period = due_period(discord.utils.utcnow())
+        if period is None:
+            return
+        try:
+            await self.run_monthly(period)
+        except Exception:
+            log.exception("월간 정산 실패 (period=%s)", period)
+
+    async def run_monthly(self, period: str):
+        async with self.lock:
+            if await self.pool.fetchval("SELECT 1 FROM voice_monthly WHERE period = $1", period):
+                return  # 이번 달은 이미 실행함
+            guild = self.bot.get_guild(self.guild_id)
+            if not self.online or guild is None or guild.unavailable or not guild.chunked:
+                return  # 다음 분에 다시 시도
+
+            channel = guild.get_channel(LOG_CHANNEL_ID)
+            problems = monthly_problems(guild)
+            if problems:
+                await self.report_monthly_error(channel, ", ".join(problems))
+                return
+
+            await self._sync_locked()
+            rows = await self.pool.fetch(
+                "SELECT * FROM voice_stats ORDER BY games DESC, total_seconds DESC"
+            )
+            games = {r["user_id"]: r["games"] for r in rows}
+            if not any(games.values()):
+                # 집계 고장이나 직전 초기화로 모두가 해제되는 것을 막는다
+                await self.report_monthly_error(channel, "1회 이상 참여한 기록이 하나도 없음")
+                return
+            removals, grants = monthly_plan(guild, games)
+
+            # 1) CSV 업로드. 실패하면 여기서 멈추고 아무것도 바꾸지 않는다
+            await channel.send(
+                f"📄 {period} 월간 정산: 초기화 전 게임 기록",
+                file=build_csv(guild, [r for r in rows if r["games"] > 0]),
+            )
+            # 2) 실행 기록과 초기화를 한 번에: 두 번 실행되지 않게 한다
+            async with self.pool.acquire() as conn, conn.transaction():
+                claimed = await conn.fetchval(
+                    "INSERT INTO voice_monthly (period) VALUES ($1) "
+                    "ON CONFLICT DO NOTHING RETURNING period", period,
+                )
+                if claimed is None:
+                    return
+                await conn.execute("TRUNCATE voice_stats")
+            log.warning("월간 정산 %s: 게임 기록 초기화", period)
+
+        # 3) 역할 변경과 DM (집계가 멈추지 않도록 잠금 밖에서)
+        removed = await change_roles(guild, removals, grant=False)
+        granted = await change_roles(guild, grants, grant=True)
+
+        # 4) 결과 로그
+        lines = [f"**{period} 월간 정산 결과**", f"**Elite 해제 {len(removed)}명**"]
+        lines += removed or ["- 없음"]
+        lines += [f"**Elite 부여 {len(granted)}명**"]
+        lines += granted or ["- 없음"]
+        lines += ["게임 기록을 초기화했어요."]
+        for text in split_lines(lines, 2000):
+            await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+
+    async def report_monthly_error(self, channel, reason: str):
+        if reason == self.monthly_error:
+            return
+        self.monthly_error = reason
+        log.error("월간 정산을 실행하지 못함: %s", reason)
+        if channel is not None:
+            try:
+                await channel.send(f"⚠️ 월간 정산을 실행하지 못했어요: {reason}")
+            except discord.HTTPException:
+                log.exception("로그 채널에 알리지 못함")
+
     # ── 연결 상태 ──
     @commands.Cog.listener()
     async def on_ready(self):
@@ -323,6 +573,15 @@ class VoiceTracker(commands.Cog):
         await self.safe_sync()
         if not self.tick.is_running():
             self.tick.start()
+        if not self.monthly.is_running():
+            self.monthly.start()
+        guild = self.bot.get_guild(self.guild_id)
+        if guild is not None:
+            problems = monthly_problems(guild)
+            if problems:
+                log.warning("월간 정산 설정 확인 필요: %s", ", ".join(problems))
+            else:
+                log.info("월간 정산 설정 정상 (첫 실행 %s-01 %s시)", MONTHLY_FIRST_RUN, MONTHLY_HOUR)
         log.info(
             "준비 완료 (인정 기준 %s명, %s분, 부관리자 역할 %s)",
             MIN_MEMBERS, MIN_MINUTES, SUB_MANAGER_ROLE_ID or "없음",
@@ -400,21 +659,8 @@ class VoiceTracker(commands.Cog):
             "SELECT * FROM voice_stats WHERE games > 0 "
             "ORDER BY games DESC, total_seconds DESC"
         )
-        buffer = io.StringIO()
-        writer = csv.writer(buffer)
-        writer.writerow(["유저ID", "계정명", "닉네임", "게임횟수", "누적시간(분)"])
-        for r in rows:
-            member = interaction.guild.get_member(r["user_id"])
-            writer.writerow([
-                r["user_id"],
-                csv_safe(member.name) if member else "",
-                csv_safe(member.display_name) if member else "(서버에 없음)",
-                r["games"],
-                r["total_seconds"] // 60,
-            ])
-        data = io.BytesIO(buffer.getvalue().encode("utf-8-sig"))  # 엑셀 한글 깨짐 방지
         await interaction.followup.send(
-            file=discord.File(data, filename="voice_stats.csv"), ephemeral=True
+            file=build_csv(interaction.guild, rows), ephemeral=True
         )
 
     @app_commands.command(name="게임기록초기화", description="게임 횟수와 누적 시간을 모두 삭제합니다")
@@ -426,6 +672,18 @@ class VoiceTracker(commands.Cog):
             view=ResetConfirmView(self, interaction),
             ephemeral=True,
         )
+
+    @app_commands.command(name="역할변경미리보기", description="월간 정산에서 해제·부여될 대상을 미리 봅니다")
+    @staff_only
+    async def preview(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        await self.safe_sync()
+        rows = await self.pool.fetch("SELECT user_id, games FROM voice_stats")
+        games = {r["user_id"]: r["games"] for r in rows}
+        for text in split_lines(preview_lines(interaction.guild, games), 2000):
+            await interaction.followup.send(
+                text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+            )
 
     @app_commands.command(name="게임상태", description="지금 집계 중인 방과 누적 시간을 봅니다")
     @staff_only
