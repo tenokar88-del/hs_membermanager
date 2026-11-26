@@ -363,7 +363,7 @@ class VoiceTracker(commands.Cog):
         pages = split_lines(lines, 4096) or ["아직 기록이 없어요."]
         for number, page in enumerate(pages, 1):
             embed = discord.Embed(title="게임 횟수 랭킹", description=page)
-            footer = f"{MIN_MEMBERS}명 이상 {MIN_MINUTES}분 이상 함께하면 1회"
+            footer = "" #f"{MIN_MEMBERS}명 이상 {MIN_MINUTES}분 이상 함께하면 1회"
             if len(pages) > 1:
                 footer += f" · {number}/{len(pages)}"
             embed.set_footer(text=footer)
@@ -380,7 +380,7 @@ class VoiceTracker(commands.Cog):
         )
         buffer = io.StringIO()
         writer = csv.writer(buffer)
-        writer.writerow(["유저ID", "계정명", "닉네임", "게임횟수", "함께한_분"])
+        writer.writerow(["유저ID", "계정명", "닉네임", "게임횟수", "누적시간(분)"])
         for r in rows:
             member = interaction.guild.get_member(r["user_id"])
             writer.writerow([
