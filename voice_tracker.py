@@ -326,7 +326,7 @@ def preview_lines(guild, games: dict[int, int]) -> list[str]:
 def removal_message(guild_name: str, roles: str, count: int) -> str:
     return (
         f"안녕하세요, **{guild_name}** 서버에서 알려드려요.\n"
-        f"지난 집계 기간의 게임 참여가 {count}회로 활동 기준에 미치지 못해 "
+        f"지난 집계 기간의 게임 참여가 활동 기준에 미치지 못해 "
         f"**{roles}** 역할이 해제되었어요.\n"
         "앞으로도 게임에서 자주 만나요!"
     )
@@ -335,7 +335,7 @@ def removal_message(guild_name: str, roles: str, count: int) -> str:
 def grant_message(guild_name: str, roles: str, count: int) -> str:
     return (
         f"축하해요! 🎉 **{guild_name}** 서버에서 알려드려요.\n"
-        f"지난 집계 기간에 게임에 {count}회 참여해 활동 기준을 채워서 "
+        f"지난 집계 기간에 게임 참여가 활동 기준을 채워서 "
         f"**{roles}** 역할이 부여되었어요.\n"
         "함께해 주셔서 감사해요!"
     )
