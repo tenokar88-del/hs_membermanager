@@ -8,6 +8,7 @@ import asyncio
 import csv
 import io
 import logging
+import os
 import re
 from collections import Counter
 from datetime import datetime, timedelta
@@ -24,6 +25,8 @@ TICK_SECONDS = 120                 # 중간 정산 주기(초)
 RANKING_SIZE = 50                 # /게임랭킹 에 보여줄 인원
 ROOM_ROLE_PATTERN = re.compile(r"Room-\d+-Member")  # 게임방을 알아보는 역할 이름
 EXCLUDED_CATEGORY_IDS: set[int] = {1508118244727197887, 1509798130760155259, 1508468808849821798}             # 무조건 제외할 카테고리 ID
+# 부관리자 역할 ID (환경 변수, 없으면 서버 관리자만 사용)
+SUB_MANAGER_ROLE_ID = int(os.getenv("SUB_MANAGER_ROLE_ID", "").strip() or 0)
 # ────────────────────────────────
 
 SCHEMA = """
@@ -198,6 +201,22 @@ def admin_only(func):
     return app_commands.guild_only()(func)
 
 
+def is_staff(interaction) -> bool:
+    """서버 관리자 또는 부관리자 역할."""
+    if interaction.permissions.manage_guild:
+        return True
+    return any(
+        role.id == SUB_MANAGER_ROLE_ID for role in getattr(interaction.user, "roles", [])
+    )
+
+
+def staff_only(func):
+    """관리자 + 부관리자용. 부관리자에게 보이게 하려면 서버 설정 → 연동에서도 허용해야 한다."""
+    func = app_commands.check(is_staff)(func)
+    func = app_commands.default_permissions(manage_guild=True)(func)
+    return app_commands.guild_only()(func)
+
+
 class ResetConfirmView(discord.ui.View):
     """기록 초기화 전 [삭제] / [취소] 확인."""
 
@@ -304,7 +323,10 @@ class VoiceTracker(commands.Cog):
         await self.safe_sync()
         if not self.tick.is_running():
             self.tick.start()
-        log.info("준비 완료 (인정 기준 %s명, %s분)", MIN_MEMBERS, MIN_MINUTES)
+        log.info(
+            "준비 완료 (인정 기준 %s명, %s분, 부관리자 역할 %s)",
+            MIN_MEMBERS, MIN_MINUTES, SUB_MANAGER_ROLE_ID or "없음",
+        )
 
     @commands.Cog.listener()
     async def on_resumed(self):
@@ -336,7 +358,7 @@ class VoiceTracker(commands.Cog):
     # ── 명령어 (서버 관리 권한 필요, 본인에게만 보임) ──
     async def cog_app_command_error(self, interaction, error):
         if isinstance(error, app_commands.CheckFailure):
-            message = "서버 관리 권한이 필요해요."
+            message = "이 명령어를 쓸 권한이 없어요."
         else:
             log.error("명령어 오류", exc_info=error)
             message = "처리 중 오류가 났어요. 봇 로그를 확인해 주세요."
@@ -346,7 +368,7 @@ class VoiceTracker(commands.Cog):
             await interaction.response.send_message(message, ephemeral=True)
 
     @app_commands.command(name="게임랭킹", description="게임 횟수 순위를 봅니다")
-    @admin_only
+    @staff_only
     async def ranking(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         await self.safe_sync()
@@ -370,7 +392,7 @@ class VoiceTracker(commands.Cog):
             await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="내보내기", description="전체 유저 기록을 CSV로 받습니다")
-    @admin_only
+    @staff_only
     async def export(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         await self.safe_sync()
@@ -406,7 +428,7 @@ class VoiceTracker(commands.Cog):
         )
 
     @app_commands.command(name="게임상태", description="지금 집계 중인 방과 누적 시간을 봅니다")
-    @admin_only
+    @staff_only
     async def status(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         await self.safe_sync()
